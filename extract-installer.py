@@ -17,7 +17,10 @@ from typing import Callable
 OutputCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int], None]
 
-FORMATS = ("appimage", "flatpak", "inno", "mojo", "pkg")
+FORMATS = (
+    "appimage", "flatpak", "inno", "mojo", "pkg", "rpm", "deb", "7z", "iso",
+    "nsis", "zip", "tar", "msi",
+)
 
 FORMAT_DISPLAY = {
     "appimage": "AppImage",
@@ -25,6 +28,14 @@ FORMAT_DISPLAY = {
     "inno": "Inno Setup (Windows installer)",
     "mojo": "GOG MojoSetup (.sh)",
     "pkg": "macOS Installer (.pkg / XAR)",
+    "rpm": "RPM Package",
+    "deb": "Debian Package (.deb)",
+    "7z": "7-Zip Archive (.7z)",
+    "iso": "ISO 9660 Disk Image (.iso)",
+    "nsis": "NSIS Installer (Windows, .exe)",
+    "zip": "ZIP Archive",
+    "tar": "Tar Archive (.tar / .tar.gz / .tar.bz2 / .tar.xz)",
+    "msi": "Windows Installer (.msi)",
 }
 
 MOJO_OFFSET_RE = re.compile(r'offset=`head -n (\d+?) "\$0"')
@@ -134,11 +145,16 @@ def list_files(startpath: Path, output: OutputCallback = print, max_entries: int
 #
 # Detection is a mix of magic-byte sniffing (reliable, used where a real
 # signature exists) and extension (used as a fallback where it doesn't).
-# AppImage, Inno/MojoSetup, and XAR/.pkg all embed identifiable markers near
-# the start of the file, so those are sniffed directly. Flatpak single-file
-# bundles don't have a simple, well-documented magic sequence worth
-# hand-rolling, so that one is extension-only — if that's ever not good
-# enough, pass --format flatpak explicitly.
+# AppImage, Inno/NSIS/MojoSetup, XAR/.pkg, RPM, .deb, 7z, zip, and MSI all
+# embed identifiable markers, so those are sniffed directly. ISO 9660's
+# "CD001" identifier and plain tar's "ustar" identifier both sit at a fixed
+# offset near (not at) the start of the file, which is just as reliable to
+# check. Flatpak single-file bundles don't have a simple, well-documented
+# magic sequence worth hand-rolling, so that one is extension-only — if
+# that's ever not good enough, pass --format flatpak explicitly. Compressed
+# tar (.tar.gz/.tar.bz2/.tar.xz) is a special case: the tar structure itself
+# is inside the compressed stream, invisible without decompressing, so
+# those check the compressor's own magic gated by a matching extension.
 
 def _looks_like_appimage(header: bytes) -> bool:
     # ELF magic, followed by the "AI" + type-byte AppImage marker at offset 8.
@@ -159,9 +175,72 @@ def _looks_like_inno(prefix: bytes) -> bool:
     return b"Inno Setup" in prefix
 
 
+def _looks_like_nsis(prefix: bytes) -> bool:
+    return b"NullsoftInst" in prefix
+
+
 def _looks_like_xar(header: bytes) -> bool:
     # XAR container magic — macOS .pkg installers are XAR archives.
     return header[:4] == b"xar!"
+
+
+def _looks_like_rpm(header: bytes) -> bool:
+    return header[:4] == b"\xed\xab\xee\xdb"
+
+
+def _looks_like_deb(header: bytes) -> bool:
+    # ar archive magic, whose first member is Debian's "debian-binary"
+    # marker file — the plain ar magic alone is shared with plain static
+    # library (.a) archives, so check the member name too.
+    return header[:8] == b"!<arch>\n" and header[8:21] == b"debian-binary"
+
+
+def _looks_like_7z(header: bytes) -> bool:
+    return header[:6] == b"7z\xbc\xaf\x27\x1c"
+
+
+def _looks_like_zip(header: bytes) -> bool:
+    return header[:4] == b"PK\x03\x04"
+
+
+def _looks_like_msi(header: bytes) -> bool:
+    # OLE/CFB compound-file magic. Not unique to MSI (old .doc/.xls/.msg use
+    # it too), so detect_format also gates this on the .msi extension.
+    return header[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _looks_like_iso(f) -> bool:
+    # Volume descriptor identifier "CD001", 16 * 2048-byte sectors in, plus
+    # one byte for the descriptor-type field that precedes it.
+    try:
+        f.seek(32769)
+        ident = f.read(5)
+    except OSError:
+        return False
+    return ident == b"CD001"
+
+
+def _looks_like_tar(f) -> bool:
+    # Plain (uncompressed) .tar: the classic "ustar" magic sits at a fixed
+    # offset (257 bytes) into the first 512-byte header block.
+    try:
+        f.seek(257)
+        magic = f.read(6)
+    except OSError:
+        return False
+    return magic in (b"ustar\x00", b"ustar ")
+
+
+def _looks_like_compressed_tar(path: Path, header: bytes) -> bool:
+    # tarfile auto-detects the compression once opened, but there's no way
+    # to tell "this is a compressed tar" vs. "this is just a gzip/bzip2/xz
+    # file" from the compressed bytes alone — so this also requires the
+    # matching double extension.
+    suffix = "".join(path.suffixes).lower()
+    is_gz = suffix.endswith((".tar.gz", ".tgz")) and header[:2] == b"\x1f\x8b"
+    is_bz2 = suffix.endswith((".tar.bz2", ".tbz2")) and header[:3] == b"BZh"
+    is_xz = suffix.endswith((".tar.xz", ".txz")) and header[:6] == b"\xfd7zXZ\x00"
+    return is_gz or is_bz2 or is_xz
 
 
 def detect_format(path: Path) -> str | None:
@@ -169,9 +248,11 @@ def detect_format(path: Path) -> str | None:
     of FORMATS, or None if nothing matched confidently."""
     try:
         with open(path, "rb") as f:
-            header = f.read(16)
+            header = f.read(24)
             f.seek(0)
-            prefix = f.read(4 * 1024 * 1024)  # plenty for the mojo/inno markers
+            prefix = f.read(4 * 1024 * 1024)  # plenty for the mojo/inno/nsis markers
+            is_iso = _looks_like_iso(f)
+            is_tar = _looks_like_tar(f)
     except OSError:
         return None
 
@@ -181,21 +262,63 @@ def detect_format(path: Path) -> str | None:
     if _looks_like_xar(header):
         return "pkg"
 
+    if _looks_like_rpm(header):
+        return "rpm"
+
+    if _looks_like_deb(header):
+        return "deb"
+
+    if _looks_like_7z(header):
+        return "7z"
+
+    if _looks_like_zip(header):
+        return "zip"
+
+    if path.suffix.lower() == ".msi" and _looks_like_msi(header):
+        return "msi"
+
+    if is_iso:
+        return "iso"
+
+    if is_tar or _looks_like_compressed_tar(path, header):
+        return "tar"
+
     if path.suffix.lower() == ".flatpak":
         return "flatpak"
 
     if (path.suffix.lower() == ".sh" or prefix.startswith(b"#!")) and _looks_like_mojo(prefix):
         return "mojo"
 
-    if (path.suffix.lower() == ".exe" or header[:2] == b"MZ") and _looks_like_inno(prefix):
-        return "inno"
+    if path.suffix.lower() == ".exe" or header[:2] == b"MZ":
+        if _looks_like_inno(prefix):
+            return "inno"
+        if _looks_like_nsis(prefix):
+            return "nsis"
 
     return None
 
 
 def default_outdir(input_file: Path, fmt: str) -> Path:
-    suffix = {"appimage": "-appimage", "flatpak": "-flatpak", "pkg": "-pkg"}.get(fmt, "")
-    return Path(f"{input_file.stem}{suffix}").resolve()
+    stem = input_file.stem
+    if fmt == "tar" and len(input_file.suffixes) >= 2 and input_file.suffixes[-2].lower() == ".tar":
+        # Path.stem only strips one suffix, so "game.tar.gz" would otherwise
+        # leave a stem of "game.tar" — strip the compression suffix too.
+        stem = input_file.name[: -sum(len(s) for s in input_file.suffixes[-2:])]
+
+    suffix = {
+        "appimage": "-appimage",
+        "flatpak": "-flatpak",
+        "pkg": "-pkg",
+        "rpm": "-rpm",
+        "deb": "-deb",
+        "7z": "-7z",
+        "iso": "-iso",
+        "nsis": "-nsis",
+        "zip": "-zip",
+        "tar": "-tar",
+        "msi": "-msi",
+    }.get(fmt, "")
+    return Path(f"{stem}{suffix}").resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +465,78 @@ def extract_inno(
 
 
 # ---------------------------------------------------------------------------
+# cpio archive helpers (used by macOS .pkg payloads and RPM packages)
+# ---------------------------------------------------------------------------
+#
+# Both formats ultimately unpack via "some command that emits a cpio stream
+# on stdout, piped into cpio itself" — `gzip -dc payload | cpio -idm` for a
+# .pkg's Payload/Scripts, `rpm2cpio pkg.rpm | cpio -idm` for an RPM. These
+# helpers capture that shape once: list members first (for a path-traversal
+# check, same idea as the tar/zip handling in extract_mojo), then extract.
+
+def _cpio_list(source_cmd: list[str]) -> list[str] | None:
+    """Lists entry names in a cpio stream produced by `source_cmd`, without
+    extracting anything. Returns None if either program is missing or the
+    listing failed."""
+    try:
+        source = subprocess.Popen(source_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            result = subprocess.run(
+                ["cpio", "-t"],
+                stdin=source.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        finally:
+            source.stdout.close()
+            source.wait()
+    except (FileNotFoundError, OSError):
+        return None
+
+    if source.returncode != 0 or result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _cpio_extract(source_cmd: list[str], extract_dir: Path) -> subprocess.CompletedProcess | None:
+    """Runs `source_cmd | cpio -idm` into extract_dir. Returns the cpio
+    CompletedProcess (check .returncode), or None if either program is
+    missing or failed to start."""
+    try:
+        source = subprocess.Popen(source_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            result = subprocess.run(
+                ["cpio", "-idm"],
+                stdin=source.stdout,
+                cwd=extract_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        finally:
+            source.stdout.close()
+            source.wait()
+    except (FileNotFoundError, OSError):
+        return None
+
+    if source.returncode != 0:
+        return None
+    return result
+
+
+def _find_unsafe_cpio_member(members: list[str], extract_dir: Path) -> str | None:
+    """Returns the first member name that would resolve outside extract_dir
+    (an absolute path or a '../' escape), or None if every member is safe."""
+    resolved_root = extract_dir.resolve()
+    for name in members:
+        target = (extract_dir / name).resolve()
+        if target != resolved_root and not target.is_relative_to(resolved_root):
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
 # macOS Installer (.pkg / XAR)
 # ---------------------------------------------------------------------------
 #
@@ -357,32 +552,6 @@ def extract_inno(
 # but some newer installers compress with something else (bzip2, etc), in
 # which case the archive is left as-is with a note rather than failing the
 # whole extraction.
-
-def _cpio_gz_list(payload_path: Path) -> list[str] | None:
-    """Lists entry names in a gzip-compressed cpio archive via `gzip -dc |
-    cpio -t`, without extracting anything. Returns None if either tool is
-    missing or the listing failed."""
-    try:
-        with open(payload_path, "rb") as compressed:
-            gunzip = subprocess.Popen(["gzip", "-dc"], stdin=compressed, stdout=subprocess.PIPE)
-            try:
-                result = subprocess.run(
-                    ["cpio", "-t"],
-                    stdin=gunzip.stdout,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                )
-            finally:
-                gunzip.stdout.close()
-                gunzip.wait()
-    except (FileNotFoundError, OSError):
-        return None
-
-    if gunzip.returncode != 0 or result.returncode != 0:
-        return None
-    return [line for line in result.stdout.splitlines() if line]
-
 
 def _extract_payload(payload_path: Path, output: OutputCallback = print) -> None:
     """
@@ -401,7 +570,8 @@ def _extract_payload(payload_path: Path, output: OutputCallback = print) -> None
         output(f"Note: {payload_path.name} isn't gzip-compressed — leaving it as-is.")
         return
 
-    members = _cpio_gz_list(payload_path)
+    source_cmd = ["gzip", "-dc", str(payload_path)]
+    members = _cpio_list(source_cmd)
     if members is None:
         output(
             f"Note: 'gzip'/'cpio' unavailable or failed to read {payload_path.name} "
@@ -410,40 +580,20 @@ def _extract_payload(payload_path: Path, output: OutputCallback = print) -> None
         return
 
     extract_dir = payload_path.parent / f"{payload_path.name}.extracted"
-    resolved_root = extract_dir.resolve()
-    for name in members:
-        target = (extract_dir / name).resolve()
-        if target != resolved_root and not target.is_relative_to(resolved_root):
-            output(
-                f"Warning: refusing to unpack {payload_path.name} — unsafe path in "
-                f"archive: {name}"
-            )
-            return
-
-    extract_dir.mkdir(exist_ok=True)
-    try:
-        with open(payload_path, "rb") as compressed:
-            gunzip = subprocess.Popen(["gzip", "-dc"], stdin=compressed, stdout=subprocess.PIPE)
-            try:
-                cpio_result = subprocess.run(
-                    ["cpio", "-idm"],
-                    stdin=gunzip.stdout,
-                    cwd=extract_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-            finally:
-                gunzip.stdout.close()
-                gunzip.wait()
-    except OSError as e:
-        output(f"Warning: Failed to unpack {payload_path.name}: {e}")
+    unsafe = _find_unsafe_cpio_member(members, extract_dir)
+    if unsafe:
+        output(
+            f"Warning: refusing to unpack {payload_path.name} — unsafe path in "
+            f"archive: {unsafe}"
+        )
         return
 
-    if gunzip.returncode != 0 or cpio_result.returncode != 0:
+    extract_dir.mkdir(exist_ok=True)
+    result = _cpio_extract(source_cmd, extract_dir)
+    if result is None or result.returncode != 0:
         output(f"Warning: Failed to fully unpack {payload_path.name} (gzip/cpio reported an error).")
-        if cpio_result.stderr:
-            output(cpio_result.stderr.strip())
+        if result is not None and result.stderr:
+            output(result.stderr.strip())
         return
 
     try:
@@ -473,6 +623,218 @@ def extract_pkg(input_file: Path, outdir: Path, tmpdir: Path, output: OutputCall
         for payload in staging.rglob(name):
             if payload.is_file():
                 _extract_payload(payload, output)
+
+    shutil.move(str(staging), str(outdir))
+
+    output("DONE.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# RPM Package
+# ---------------------------------------------------------------------------
+#
+# An RPM's payload is a cpio archive, optionally compressed, inside the RPM
+# container proper (a lead + signature + header + payload). `rpm2cpio`
+# handles unwrapping and decompressing that in one step and writes a plain
+# cpio stream to stdout, which is then unpacked the same way a .pkg's
+# Payload is (see the shared cpio helpers above).
+
+def extract_rpm(input_file: Path, outdir: Path, tmpdir: Path, output: OutputCallback = print) -> bool:
+    staging = tmpdir / "extracted"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    source_cmd = ["rpm2cpio", str(input_file)]
+    output(f"⏳ rpm2cpio {input_file} | cpio -idm")
+
+    members = _cpio_list(source_cmd)
+    if members is None:
+        output("Error: 'rpm2cpio' or 'cpio' not found, or failed to list the archive.")
+        return False
+
+    unsafe = _find_unsafe_cpio_member(members, staging)
+    if unsafe:
+        output(f"Error: refusing to extract unsafe path from archive: {unsafe}")
+        return False
+
+    result = _cpio_extract(source_cmd, staging)
+    if result is None or result.returncode != 0:
+        output("Error: rpm2cpio/cpio failed to extract the archive.")
+        if result is not None and result.stderr:
+            output(result.stderr.strip())
+        return False
+
+    if not any(staging.iterdir()):
+        output("Error: extraction reported success but nothing was extracted.")
+        return False
+
+    shutil.move(str(staging), str(outdir))
+
+    output("DONE.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Debian Package (.deb)
+# ---------------------------------------------------------------------------
+#
+# A .deb is an `ar` archive containing debian-binary, a control.tar.* and a
+# data.tar.* member. `dpkg-deb -x` reads that structure and unpacks just the
+# data (the installed files) directly, which is really all this tool cares
+# about extracting.
+
+def extract_deb(input_file: Path, outdir: Path, tmpdir: Path, output: OutputCallback = print) -> bool:
+    staging = tmpdir / "extracted"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    if not run_command(["dpkg-deb", "-x", str(input_file), str(staging)], "dpkg-deb", output):
+        return False
+
+    if not any(staging.iterdir()):
+        output("Error: dpkg-deb reported success but nothing was extracted.")
+        return False
+
+    shutil.move(str(staging), str(outdir))
+
+    output("DONE.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 7-Zip, ISO 9660, NSIS, and MSI — all unpacked the same way via 7z
+# ---------------------------------------------------------------------------
+#
+# `7z x` reads all four formats natively: .7z is its own format, ISO 9660
+# is a well-specified flat filesystem it parses directly (no partition/
+# compression guesswork the way a macOS .dmg needs), NSIS installers are PE
+# executables 7z knows how to unpack via its built-in NSIS module, and MSI
+# is 7z's built-in OLE/CFB compound-file reader. Same shape as extract_pkg,
+# just a different single command.
+
+def _extract_via_7z(input_file: Path, outdir: Path, tmpdir: Path, output: OutputCallback = print) -> bool:
+    staging = tmpdir / "extracted"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    if not run_command(["7z", "x", "-y", f"-o{staging}", str(input_file)], "7z", output):
+        return False
+
+    if not any(staging.iterdir()):
+        output("Error: 7z reported success but nothing was extracted.")
+        return False
+
+    shutil.move(str(staging), str(outdir))
+
+    output("DONE.")
+    return True
+
+
+extract_7z = _extract_via_7z
+extract_iso = _extract_via_7z
+extract_nsis = _extract_via_7z
+extract_msi = _extract_via_7z
+
+
+# ---------------------------------------------------------------------------
+# Safe tar/zip extraction helpers (used by .tar/.zip and by MojoSetup, which
+# splits into a tar and a zip internally)
+# ---------------------------------------------------------------------------
+#
+# Both are stdlib-only — tarfile auto-detects gzip/bzip2/xz compression, so
+# one function covers plain .tar plus every common compressed variant. Both
+# list members first and check for path-traversal before extracting
+# anything, the same idea as the cpio member checks used for .pkg/.rpm.
+
+def _extract_tar_safe(
+    archive_path: Path, extract_dir: Path, progress: ProgressCallback | None = None
+) -> tuple[bool, str]:
+    try:
+        with tarfile.open(archive_path) as tf:
+            members = tf.getmembers()
+
+            resolved_root = extract_dir.resolve()
+            for member in members:
+                target = (extract_dir / member.name).resolve()
+                if target != resolved_root and not target.is_relative_to(resolved_root):
+                    return False, f"Refusing to extract unsafe path from {archive_path.name}: {member.name}"
+
+            total_uncompressed = sum(m.size for m in members) or 1
+            extracted = 0
+            for member in members:
+                tf.extract(member, path=extract_dir)
+                extracted += member.size
+                if progress is not None:
+                    progress(extracted, total_uncompressed)
+    except tarfile.TarError as e:
+        return False, f"{archive_path.name} is not a valid tar archive: {e}"
+    except OSError as e:
+        return False, f"An error occurred while extracting {archive_path.name}: {e}"
+    return True, "OK"
+
+
+def _extract_zip_safe(
+    archive_path: Path, extract_dir: Path, progress: ProgressCallback | None = None
+) -> tuple[bool, str]:
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            infos = zf.infolist()
+
+            resolved_root = extract_dir.resolve()
+            for info in infos:
+                target = (extract_dir / info.filename).resolve()
+                if target != resolved_root and not target.is_relative_to(resolved_root):
+                    return False, f"Refusing to extract unsafe path from {archive_path.name}: {info.filename}"
+
+            total_uncompressed = sum(i.file_size for i in infos) or 1
+            extracted = 0
+            for info in infos:
+                zf.extract(info, path=extract_dir)
+                extracted += info.file_size
+                if progress is not None:
+                    progress(extracted, total_uncompressed)
+    except zipfile.BadZipFile as e:
+        return False, f"{archive_path.name} is not a valid zip archive: {e}"
+    except OSError as e:
+        return False, f"An error occurred while extracting {archive_path.name}: {e}"
+    return True, "OK"
+
+
+# ---------------------------------------------------------------------------
+# zip / tar (.tar, .tar.gz, .tar.bz2, .tar.xz, and friends)
+# ---------------------------------------------------------------------------
+#
+# No external tool needed for either — see the shared helpers above.
+
+def extract_zip(input_file: Path, outdir: Path, tmpdir: Path, output: OutputCallback = print) -> bool:
+    staging = tmpdir / "extracted"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    success, message = _extract_zip_safe(input_file, staging)
+    if not success:
+        output(f"Error: {message}")
+        return False
+
+    if not any(staging.iterdir()):
+        output("Error: extraction reported success but nothing was extracted.")
+        return False
+
+    shutil.move(str(staging), str(outdir))
+
+    output("DONE.")
+    return True
+
+
+def extract_tar(input_file: Path, outdir: Path, tmpdir: Path, output: OutputCallback = print) -> bool:
+    staging = tmpdir / "extracted"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    success, message = _extract_tar_safe(input_file, staging)
+    if not success:
+        output(f"Error: {message}")
+        return False
+
+    if not any(staging.iterdir()):
+        output("Error: extraction reported success but nothing was extracted.")
+        return False
 
     shutil.move(str(staging), str(outdir))
 
@@ -583,27 +945,9 @@ def extract_mojo(
         )
 
     output(f"Extracting {mojosetup_path.name} …")
-    try:
-        with tarfile.open(mojosetup_path) as tf:
-            members = tf.getmembers()
-
-            resolved_root = mojosetup_extract_dir.resolve()
-            for member in members:
-                target = (mojosetup_extract_dir / member.name).resolve()
-                if target != resolved_root and not target.is_relative_to(resolved_root):
-                    return False, f"Refusing to extract unsafe path from mojosetup.tar.gz: {member.name}"
-
-            total_uncompressed = sum(m.size for m in members) or 1
-            extracted = 0
-            for member in members:
-                tf.extract(member, path=mojosetup_extract_dir)
-                extracted += member.size
-                if progress is not None:
-                    progress(extracted, total_uncompressed)
-    except tarfile.TarError as e:
-        return False, f"mojosetup.tar.gz is not a valid tar archive: {e}"
-    except OSError as e:
-        return False, f"An error occurred while extracting mojosetup.tar.gz: {e}"
+    success, message = _extract_tar_safe(mojosetup_path, mojosetup_extract_dir, progress)
+    if not success:
+        return False, message
 
     try:
         mojosetup_path.unlink()
@@ -611,27 +955,9 @@ def extract_mojo(
         output(f"Warning: extraction succeeded but failed to remove {mojosetup_path.name}: {e}")
 
     output(f"Extracting {data_path.name} …")
-    try:
-        with zipfile.ZipFile(data_path) as zf:
-            infos = zf.infolist()
-
-            resolved_root = data_extract_dir.resolve()
-            for info in infos:
-                target = (data_extract_dir / info.filename).resolve()
-                if target != resolved_root and not target.is_relative_to(resolved_root):
-                    return False, f"Refusing to extract unsafe path from data.zip: {info.filename}"
-
-            total_uncompressed = sum(i.file_size for i in infos) or 1
-            extracted = 0
-            for info in infos:
-                zf.extract(info, path=data_extract_dir)
-                extracted += info.file_size
-                if progress is not None:
-                    progress(extracted, total_uncompressed)
-    except zipfile.BadZipFile as e:
-        return False, f"data.zip is not a valid zip archive: {e}"
-    except OSError as e:
-        return False, f"An error occurred while extracting data.zip: {e}"
+    success, message = _extract_zip_safe(data_path, data_extract_dir, progress)
+    if not success:
+        return False, message
 
     try:
         data_path.unlink()
@@ -709,14 +1035,23 @@ def run_extraction(
         tmpdir = Path(tempfile.mkdtemp(prefix=f"{fmt}-extract-"))
 
     try:
-        if fmt == "appimage":
-            success = extract_appimage(input_file, outdir, tmpdir, output)
-        elif fmt == "flatpak":
-            success = extract_flatpak(input_file, outdir, tmpdir, output)
-        elif fmt == "pkg":
-            success = extract_pkg(input_file, outdir, tmpdir, output)
-        else:  # inno
+        if fmt == "inno":
             success = extract_inno(input_file, outdir, tmpdir, output, include_gog=include_gog)
+        else:
+            extractor = {
+                "appimage": extract_appimage,
+                "flatpak": extract_flatpak,
+                "pkg": extract_pkg,
+                "rpm": extract_rpm,
+                "deb": extract_deb,
+                "7z": extract_7z,
+                "iso": extract_iso,
+                "nsis": extract_nsis,
+                "zip": extract_zip,
+                "tar": extract_tar,
+                "msi": extract_msi,
+            }[fmt]
+            success = extractor(input_file, outdir, tmpdir, output)
     except Exception as e:
         output(f"An unexpected error occurred: {e}")
         success = False
@@ -864,8 +1199,9 @@ def main_gui(initial_filename: str | None) -> int:
             input_row = QHBoxLayout()
             self.input_edit = QLineEdit()
             self.input_edit.setPlaceholderText(
-                "Path to .AppImage, .flatpak, installer .exe, GOG .sh, or "
-                "macOS .pkg file — or drag and drop a file onto this window"
+                "Path to an installer (.AppImage, .flatpak, .exe, .sh, .pkg, "
+                ".rpm, .deb, .7z, .iso, .zip, .tar.*, .msi…) — or drag and "
+                "drop a file onto this window"
             )
             self.input_edit.textChanged.connect(self.refresh_detection)
             self.input_browse = QPushButton("Browse…")
@@ -1000,10 +1336,16 @@ def main_gui(initial_filename: str | None) -> int:
                 self,
                 "Select installer file",
                 "",
-                "All supported installers (*.AppImage *.flatpak *.exe *.sh *.pkg *.xar);;"
+                "All supported installers (*.AppImage *.flatpak *.exe *.sh *.pkg "
+                "*.xar *.rpm *.deb *.7z *.iso *.zip *.tar *.tar.gz *.tgz *.tar.bz2 "
+                "*.tbz2 *.tar.xz *.txz *.msi);;"
                 "AppImage (*.AppImage);;Flatpak bundle (*.flatpak);;"
-                "Windows installer (*.exe);;GOG installer script (*.sh);;"
-                "macOS installer (*.pkg *.xar);;All files (*)",
+                "Windows installer (*.exe *.msi);;GOG installer script (*.sh);;"
+                "macOS installer (*.pkg *.xar);;RPM package (*.rpm);;"
+                "Debian package (*.deb);;7-Zip archive (*.7z);;"
+                "ISO disk image (*.iso);;ZIP archive (*.zip);;"
+                "Tar archive (*.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2 *.tar.xz *.txz);;"
+                "All files (*)",
             )
             if path:
                 self.input_edit.setText(path)
@@ -1098,9 +1440,10 @@ def main_gui(initial_filename: str | None) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="extract-installer",
-        description="Extracts AppImage, Flatpak, Inno Setup, GOG MojoSetup, or "
-        "macOS .pkg/XAR installers, auto-detecting the format unless --format "
-        "is given.",
+        description="Extracts AppImage, Flatpak, Inno Setup, NSIS, GOG "
+        "MojoSetup, macOS .pkg/XAR, RPM, .deb, .7z, .iso, .zip, .tar[.gz|"
+        ".bz2|.xz], or .msi installers, auto-detecting the format unless "
+        "--format is given.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
